@@ -61,7 +61,12 @@ function saveState(state) {
   fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2) + '\n');
 }
 
-async function amoRequest(pathAndQuery, options = {}) {
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// amoCRM enforces roughly 7 requests/second per account. Under a burst of
+// leads we can hit 429 (or a transient 5xx); retry with backoff instead of
+// letting the whole run die on a single hiccup.
+async function amoRequest(pathAndQuery, options = {}, attempt = 1) {
   const res = await fetch(`${BASE_URL}${pathAndQuery}`, {
     ...options,
     headers: {
@@ -71,6 +76,16 @@ async function amoRequest(pathAndQuery, options = {}) {
     },
   });
   if (res.status === 204) return null;
+
+  if ((res.status === 429 || res.status >= 500) && attempt <= 5) {
+    const retryAfterHeader = Number(res.headers.get('retry-after'));
+    const delayMs = Number.isFinite(retryAfterHeader) && retryAfterHeader > 0
+      ? retryAfterHeader * 1000
+      : 500 * 2 ** (attempt - 1); // 500ms, 1s, 2s, 4s, 8s
+    await sleep(delayMs);
+    return amoRequest(pathAndQuery, options, attempt + 1);
+  }
+
   const text = await res.text();
   const json = text ? JSON.parse(text) : null;
   if (!res.ok) {
