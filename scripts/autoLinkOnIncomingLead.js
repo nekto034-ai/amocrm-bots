@@ -1,8 +1,16 @@
 #!/usr/bin/env node
-// Watches the "Входящий лид" status in every configured pipeline and writes
-// each lead's own CRM link into its "Ссылка на сделку" field, once, the
-// first time that lead is seen there. Leads already sitting in the status
-// before this script's first run are recorded as a baseline and skipped.
+// Watches for leads touching the "Входящий лид" status (in any configured
+// pipeline) and writes each lead's own CRM link into its "Ссылка на сделку"
+// field, once. Combines two signals so a lead is never missed, however
+// briefly it was on the status:
+//   1. Leads currently sitting at the watched status right now.
+//   2. Leads that had a lead_status_changed event (into OR out of the
+//      watched status) since the last check — this catches leads that
+//      already moved on before this script ran again.
+//
+// On the very first run, every lead found by either signal is recorded as
+// "already handled" WITHOUT writing anything, per the requirement that only
+// leads arriving after setup should get the auto-filled link.
 
 const fs = require('fs');
 const path = require('path');
@@ -10,11 +18,13 @@ const path = require('path');
 const ROOT = path.resolve(__dirname, '..');
 const STATE_PATH = path.join(ROOT, 'data', 'auto_link_state.json');
 const LINK_FIELD_ID = 1080409; // "Ссылка на сделку" (text field, entity: leads)
+const PAGE_LIMIT = 250;
 
 const WATCHED_STATUSES = [
   { pipelineId: 8650290, statusId: 70129454, label: 'Ярославль / ВХОДЯЩИЙ ЛИД' },
   { pipelineId: 10109642, statusId: 80120054, label: 'Екатеринбург / ВХОДЯЩИЙ ЛИД' },
 ];
+const WATCHED_KEYS = new Set(WATCHED_STATUSES.map((s) => `${s.pipelineId}:${s.statusId}`));
 
 function loadEnvFile(filePath) {
   if (!fs.existsSync(filePath)) return;
@@ -41,7 +51,7 @@ if (!BASE_URL || !TOKEN) {
 
 function loadState() {
   if (!fs.existsSync(STATE_PATH)) {
-    return { initialized: false, seenLeadIds: [] };
+    return { initialized: false, lastCheckedAt: 0, filledLeadIds: [] };
   }
   return JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
 }
@@ -69,25 +79,58 @@ async function amoRequest(pathAndQuery, options = {}) {
   return json;
 }
 
-async function fetchLeadsInStatus(pipelineId, statusId) {
-  const leads = [];
+async function fetchLeadsCurrentlyAtWatchedStatuses() {
+  const leadIds = new Set();
+  for (const status of WATCHED_STATUSES) {
+    let page = 1;
+    for (;;) {
+      const query =
+        `/api/v4/leads?filter[statuses][0][pipeline_id]=${status.pipelineId}` +
+        `&filter[statuses][0][status_id]=${status.statusId}` +
+        `&limit=${PAGE_LIMIT}&page=${page}`;
+      const data = await amoRequest(query);
+      const leads = data?._embedded?.leads || [];
+      for (const lead of leads) leadIds.add(lead.id);
+      if (leads.length < PAGE_LIMIT) break;
+      page += 1;
+    }
+  }
+  return leadIds;
+}
+
+// Leads with a lead_status_changed event, since fromTs, where either side of
+// the transition (value_before or value_after) touches a watched status.
+// Checking both sides catches a lead created directly at the watched status
+// and then moved elsewhere before we noticed it was ever there.
+async function fetchLeadsTouchingWatchedStatuses(fromTs, toTs) {
+  const leadIds = new Set();
   let page = 1;
   for (;;) {
     const query =
-      `/api/v4/leads?filter[statuses][0][pipeline_id]=${pipelineId}` +
-      `&filter[statuses][0][status_id]=${statusId}` +
-      `&with=custom_fields_values&limit=250&page=${page}`;
+      `/api/v4/events?filter[type]=lead_status_changed` +
+      `&filter[created_at][from]=${fromTs}` +
+      `&filter[created_at][to]=${toTs}` +
+      `&limit=${PAGE_LIMIT}&page=${page}`;
     const data = await amoRequest(query);
-    const pageLeads = data?._embedded?.leads || [];
-    leads.push(...pageLeads);
-    if (pageLeads.length < 250) break;
+    const events = data?._embedded?.events || [];
+    for (const event of events) {
+      const before = event.value_before?.[0]?.lead_status;
+      const after = event.value_after?.[0]?.lead_status;
+      const beforeKey = before && `${before.pipeline_id}:${before.id}`;
+      const afterKey = after && `${after.pipeline_id}:${after.id}`;
+      if (WATCHED_KEYS.has(beforeKey) || WATCHED_KEYS.has(afterKey)) {
+        leadIds.add(event.entity_id);
+      }
+    }
+    if (events.length < PAGE_LIMIT) break;
     page += 1;
   }
-  return leads;
+  return leadIds;
 }
 
-function hasLinkFieldFilled(lead) {
-  const field = (lead.custom_fields_values || []).find((f) => f.field_id === LINK_FIELD_ID);
+async function isLinkFieldAlreadyFilled(leadId) {
+  const lead = await amoRequest(`/api/v4/leads/${leadId}?with=custom_fields_values`);
+  const field = (lead?.custom_fields_values || []).find((f) => f.field_id === LINK_FIELD_ID);
   const value = field?.values?.[0]?.value;
   return Boolean(value && String(value).trim());
 }
@@ -110,36 +153,40 @@ async function setLeadLinkField(leadId) {
 
 async function main() {
   const state = loadState();
-  const seen = new Set(state.seenLeadIds || []);
-
-  let allLeads = [];
-  for (const status of WATCHED_STATUSES) {
-    const leads = await fetchLeadsInStatus(status.pipelineId, status.statusId);
-    for (const lead of leads) allLeads.push(lead);
-  }
+  const nowTs = Math.floor(Date.now() / 1000);
+  const filled = new Set(state.filledLeadIds || []);
 
   if (!state.initialized) {
-    for (const lead of allLeads) seen.add(lead.id);
-    saveState({ initialized: true, seenLeadIds: [...seen] });
+    const currentlyThere = await fetchLeadsCurrentlyAtWatchedStatuses();
+    for (const id of currentlyThere) filled.add(id);
+    saveState({ initialized: true, lastCheckedAt: nowTs, filledLeadIds: [...filled] });
     console.log(
-      `Baseline run: recorded ${allLeads.length} existing lead(s) at the watched statuses. ` +
-        `They will be left untouched; only leads arriving after now will get the link.`
+      `Baseline run: recorded ${currentlyThere.size} existing lead(s) at the watched statuses as ` +
+        `already handled. They will be left untouched; only leads arriving after now will get the link.`
     );
     return;
   }
 
-  let filled = 0;
-  for (const lead of allLeads) {
-    if (seen.has(lead.id)) continue;
-    seen.add(lead.id);
-    if (hasLinkFieldFilled(lead)) continue; // safety: don't overwrite a manually filled value
-    const link = await setLeadLinkField(lead.id);
-    filled += 1;
-    console.log(`Lead ${lead.id}: set "Ссылка на сделку" = ${link}`);
+  const [currentlyThere, recentlyTouched] = await Promise.all([
+    fetchLeadsCurrentlyAtWatchedStatuses(),
+    fetchLeadsTouchingWatchedStatuses(state.lastCheckedAt, nowTs),
+  ]);
+  const candidates = new Set([...currentlyThere, ...recentlyTouched]);
+
+  let filledCount = 0;
+  for (const leadId of candidates) {
+    if (filled.has(leadId)) continue;
+    filled.add(leadId);
+    if (await isLinkFieldAlreadyFilled(leadId)) continue; // don't overwrite a manual value
+    const link = await setLeadLinkField(leadId);
+    filledCount += 1;
+    console.log(`Lead ${leadId}: set "Ссылка на сделку" = ${link}`);
   }
 
-  saveState({ initialized: true, seenLeadIds: [...seen] });
-  console.log(`Done. Checked ${allLeads.length} lead(s) currently at watched statuses, filled ${filled} new one(s).`);
+  saveState({ initialized: true, lastCheckedAt: nowTs, filledLeadIds: [...filled] });
+  console.log(
+    `Done. ${candidates.size} candidate lead(s) this run, filled ${filledCount} new one(s).`
+  );
 }
 
 main().catch((err) => {
