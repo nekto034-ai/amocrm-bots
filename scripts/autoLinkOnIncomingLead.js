@@ -192,10 +192,17 @@ async function main() {
   for (const leadId of candidates) {
     if (filled.has(leadId)) continue;
     filled.add(leadId);
-    if (await isLinkFieldAlreadyFilled(leadId)) continue; // don't overwrite a manual value
-    const link = await setLeadLinkField(leadId);
-    filledCount += 1;
-    console.log(`Lead ${leadId}: set "Ссылка на сделку" = ${link}`);
+    try {
+      if (await isLinkFieldAlreadyFilled(leadId)) continue; // don't overwrite a manual value
+      const link = await setLeadLinkField(leadId);
+      filledCount += 1;
+      console.log(`Lead ${leadId}: set "Ссылка на сделку" = ${link}`);
+    } catch (err) {
+      // A lead can vanish (deleted/merged) between being seen as a candidate and
+      // being processed. Don't let one bad lead abort the whole run or the ones
+      // after it; it's already marked handled above so we won't keep retrying it.
+      console.error(`Lead ${leadId}: skipped due to error: ${err.message}`);
+    }
   }
 
   saveState({ initialized: true, lastCheckedAt: nowTs, filledLeadIds: [...filled] });
